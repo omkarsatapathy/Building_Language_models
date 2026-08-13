@@ -221,7 +221,8 @@ class MoE(nn.Module):
         one_hot = F.one_hot(topk_idx, self.n_experts).sum(dim=1)    # [N, n_experts] dispatch count per token
         f = one_hot.float().mean(dim=0)                             # [n_experts]  fraction of tokens per expert
         aux_loss = self.n_experts * torch.sum(f * P)                # scalar
-        return out.view(B, T, C), aux_loss
+        # f[e] = fraction of tokens routed to expert e; sums to top_k. Balanced = top_k/n_experts.
+        return out.view(B, T, C), aux_loss, f.detach()
 
 class Block(nn.Module): 
     def __init__(self, config):
@@ -231,9 +232,9 @@ class Block(nn.Module):
 
     def forward(self, x):
         x = x + self.attn(x)    # attn owns its pre-norm
-        moe_out, aux = self.moe(x)
+        moe_out, aux, f = self.moe(x)
         x = x + moe_out     # moe owns its pre-norm
-        return x, aux
+        return x, aux, f
 
 
 # ______________________________________________________________________________________________________ #
@@ -303,14 +304,18 @@ class GPTMoE(nn.Module):
         x = self.drop(self.tok_emb(idx))          # [B, T, C]  — NO pos emb; RoPE handles position
 
         total_aux = 0.0
+        route_sum = 0.0
         for block in self.blocks:
-            x, aux = block(x)                     # residual/skip connections live INSIDE Block
+            x, aux, f = block(x)                  # residual/skip connections live INSIDE Block
             total_aux = total_aux + aux
+            route_sum = route_sum + f             # [n_experts] routing fraction, per layer
+
+        route_frac = route_sum / len(self.blocks) # [n_experts] avg fraction across layers
 
         x = self.final_norm(x)                    # final pre-LM-head norm
         logits = self.lm_head(x)                  # [B, T, vocab_size]
 
-        return logits, total_aux
+        return logits, total_aux, route_frac
 
 
 # ______________________________________________________________________________________________________ #
@@ -328,6 +333,13 @@ grad_accum_steps = 4               # effective batch = batch_size * grad_accum_s
 
 # autocast dtype: bf16 on CUDA, fp32 elsewhere (MPS bf16 support is spotty)
 autocast_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+from contextlib import nullcontext
+def autocast_ctx():
+    # autocast only supports cuda/cpu here; on MPS it errors, so no-op there
+    if device == "cuda":
+        return torch.autocast(device_type="cuda", dtype=autocast_dtype)
+    return nullcontext()
 
 def get_lr(step):
     if step < warmup_steps:
@@ -353,13 +365,14 @@ def train_step(model, batch_iter, optimizer, grad_accum_steps, config):
 
     loss_accum = 0.0
     aux_accum  = 0.0
+    micro_logs = []
 
     for micro in range(grad_accum_steps):
         xb, yb = next(batch_iter)
         xb, yb = xb.to(device), yb.to(device)
 
-        with torch.autocast(device_type=device, dtype=autocast_dtype):
-            logits, aux = model(xb)
+        with autocast_ctx():
+            logits, aux, route = model(xb)
             ce_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 yb.view(-1),
@@ -371,9 +384,22 @@ def train_step(model, batch_iter, optimizer, grad_accum_steps, config):
         loss_accum += loss.detach()
         aux_accum  += (aux.detach() / grad_accum_steps)
 
+        # per-micro record (raw, unscaled numbers — most informative)
+        rec = {
+            "micro":      micro,
+            "ce_loss":    ce_loss.item(),
+            "aux_loss":   aux.item(),
+            "total_loss": (ce_loss + config.aux_weight * aux).item(),
+        }
+        # per-expert routing fraction (avg over layers); balanced = top_k/n_experts
+        for e in range(config.n_experts):
+            rec[f"expert{e}_frac"] = route[e].item()
+        micro_logs.append(rec)
+
         loss.backward()
 
-    return loss_accum, aux_accum
+    return loss_accum, aux_accum, micro_logs
+
 
 @torch.no_grad()
 def evaluate(model, val_iter, eval_steps, config):
@@ -382,8 +408,8 @@ def evaluate(model, val_iter, eval_steps, config):
     for _ in range(eval_steps):
         xb, yb = next(val_iter)
         xb, yb = xb.to(device), yb.to(device)
-        with torch.autocast(device_type=device, dtype=autocast_dtype):
-            logits, aux = model(xb)
+        with autocast_ctx():
+            logits, _, _ = model(xb)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 yb.view(-1),
@@ -412,6 +438,15 @@ eval_steps = 20      # micro-batches per eval
 CKPT_DIR = Path("checkpoints")
 CKPT_DIR.mkdir(exist_ok=True)
 
+def count_params(model):
+    total  = sum(p.numel() for p in model.parameters())
+    active = total  # note: MoE stores all experts but routes to top_k
+    print(f"total params: {total:,} ({total/1e6:.2f}M)")
+    return total
+
+count_params(model)
+
+
 def save_checkpoint(model, optimizer, step, val_loss):
     ckpt = {
         "model":     model.state_dict(),
@@ -425,6 +460,29 @@ def save_checkpoint(model, optimizer, step, val_loss):
     print(f"  💾 saved {path}  (val_loss {val_loss:.4f})")
 
 
+# ---- CSV micro-batch logger ----
+import csv
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+csv_path = LOG_DIR / "train_micro_log.csv"
+
+# column order for the big CSV
+CSV_FIELDS = (
+    ["step", "micro", "ce_loss", "aux_loss", "total_loss"]            # micro-level
+    + [f"expert{e}_frac" for e in range(config.n_experts)]            # MoE routing
+    + ["step_ce_loss", "step_aux_loss"]                              # step-level means
+    + ["lr", "grad_norm", "dt_ms", "tok_per_sec", "tokens"]          # step-level meta
+    + ["wall_time_s"]                                                # seconds since start
+)
+
+csv_file   = open(csv_path, "w", newline="")
+csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
+csv_writer.writeheader()
+
+run_start = time.time()
+
+
 # ---- the loop ----
 for step in range(max_steps):
     t0 = time.time()
@@ -435,7 +493,7 @@ for step in range(max_steps):
         pg["lr"] = lr
 
     # 2) accumulate grads over micro-batches (from Piece 4)
-    loss_accum, aux_accum = train_step(
+    loss_accum, aux_accum, micro_logs = train_step(
         model, batch_iter, optimizer, grad_accum_steps, config
     )
 
@@ -452,6 +510,22 @@ for step in range(max_steps):
     tokens = config.batch_size * config.block_size * grad_accum_steps
     tok_per_sec = tokens / dt
 
+    # 5b) write every micro-batch row, enriched with step-level fields
+    for rec in micro_logs:
+        rec.update({
+            "step":          step,
+            "step_ce_loss":  (loss_accum.item() - config.aux_weight * aux_accum.item()),
+            "step_aux_loss": aux_accum.item(),
+            "lr":            lr,
+            "grad_norm":     norm.item(),
+            "dt_ms":         dt * 1000,
+            "tok_per_sec":   tok_per_sec,
+            "tokens":        tokens,
+            "wall_time_s":   time.time() - run_start,
+        })
+        csv_writer.writerow(rec)
+    csv_file.flush()     # flush each step so a crash keeps your data
+
     # 6) log
     if step % 10 == 0:
         print(
@@ -463,4 +537,7 @@ for step in range(max_steps):
         val_loss = evaluate(model, val_iter, eval_steps, config)
         print(f"  >>> eval @ step {step}: val_loss {val_loss:.4f}")
         save_checkpoint(model, optimizer, step, val_loss)
+
+csv_file.close()
+print(f"📊 wrote micro-batch log → {csv_path}")
 
