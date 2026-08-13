@@ -138,6 +138,9 @@ tensorboard/
 .huggingface/
 transformers_cache/
 
+# ---- Local datasets ----
+toy_datasets/TinyStoriesV2-GPT4-train.txt
+
 # ---- Claude ----
 claude.md
 CLAUDE.md
