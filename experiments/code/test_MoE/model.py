@@ -22,19 +22,17 @@ data = Path("toy_datasets/tiny_stories_100M.txt").read_text(encoding="utf-8")
 
 @dataclass
 class MoeConfig:
-    vocab_size: int = 50304 # use aproximate Nice numbers for faster training !
+    vocab_size: int = 50304
     block_size: int = 1024
-    n_layer: int = 6
-    n_head: int = 8
-    n_embd: int = 768
+    n_layer: int = 4          # was 6
+    n_head: int = 8           # head_dim = 128/8 = 16 (even, RoPE-ok)
+    n_embd: int = 128         # was 768
     dropout: float = 0.1
 
     batch_size: int = 32
-    #MoE specific parameters
     n_experts: int = 4
-    top_k: int = 2          # each token routes to 2 of the 4 experts
-
-    aux_weight: float = 0.01     # weight on MoE load-balancing loss
+    top_k: int = 2
+    aux_weight: float = 0.01
 
 
 
@@ -325,11 +323,11 @@ class GPTMoE(nn.Module):
 # ---- training hyperparameters ----
 max_lr        = 6e-4
 min_lr        = max_lr * 0.1        # 10% of max, per GPT-3 recipe
-warmup_steps  = 100
-max_steps     = 5000
+warmup_steps  = int(os.getenv("WARMUP_STEPS", 100))
+max_steps     = int(os.getenv("MAX_STEPS", 5000))
 weight_decay  = 0.1
 grad_clip     = 1.0
-grad_accum_steps = 4               # effective batch = batch_size * grad_accum_steps
+grad_accum_steps = int(os.getenv("GRAD_ACCUM_STEPS", 4))   # effective batch = batch_size * grad_accum_steps
 
 # autocast dtype: bf16 on CUDA, fp32 elsewhere (MPS bf16 support is spotty)
 autocast_dtype = torch.bfloat16 if device == "cuda" else torch.float32
@@ -422,18 +420,24 @@ def evaluate(model, val_iter, eval_steps, config):
 
 # ---- build everything ----
 config    = MoeConfig()
+# optional env overrides (used by run.sh smoke to fit on MPS)
+if os.getenv("BATCH_SIZE"): config.batch_size = int(os.getenv("BATCH_SIZE"))
+if os.getenv("BLOCK_SIZE"): config.block_size = int(os.getenv("BLOCK_SIZE"))
 model     = GPTMoE(config).to(device)
 # model = torch.compile(model)
 optimizer = model.configure_optimizers(weight_decay, max_lr, device)
 
-train_loader = data_loader("train", config, num_workers=2, shuffle=True)
+# num_workers=0 is safe here because the training loop runs at module level
+# (no __main__ guard); spawned workers would re-import and re-run it.
+num_workers = int(os.getenv("NUM_WORKERS", 0))
+train_loader = data_loader("train", config, num_workers=num_workers, shuffle=True)
 batch_iter   = infinite_batches(train_loader)
 
-val_loader = data_loader("val", config, num_workers=2, shuffle=False)
+val_loader = data_loader("val", config, num_workers=num_workers, shuffle=False)
 val_iter   = infinite_batches(val_loader)
 
-eval_every = 250     # steps
-eval_steps = 20      # micro-batches per eval
+eval_every = int(os.getenv("EVAL_EVERY", 250))   # steps
+eval_steps = int(os.getenv("EVAL_STEPS", 20))    # micro-batches per eval
 
 CKPT_DIR = Path("checkpoints")
 CKPT_DIR.mkdir(exist_ok=True)
