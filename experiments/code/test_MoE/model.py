@@ -19,7 +19,7 @@ data = Path("toy_datasets/tiny_stories_100M.txt").read_text(encoding="utf-8")
 
 @dataclass
 class MoeConfig:
-    vocab_size: int = 50257
+    vocab_size: int = 50304
     block_size: int = 1024
     n_layer: int = 6
     n_head: int = 8
@@ -228,3 +228,56 @@ class Block(nn.Module):
         moe_out, aux = self.moe(x)
         x = x + moe_out     # moe owns its pre-norm
         return x, aux
+
+
+# ______________________________________________________________________________________________________ #
+# ------------------------ Top-level model: GPT-MoE decoder -------------------------------------------- #
+# ______________________________________________________________________________________________________ #
+
+class GPTMoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
+        self.drop    = nn.Dropout(config.dropout)
+        self.blocks  = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.final_norm = nn.RMSNorm(config.n_embd)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight tying: input embedding and output projection share one weight matrix
+        self.lm_head.weight = self.tok_emb.weight
+
+        self.apply(self._init_weights)
+   
+    def _init_weights(self, module):
+        # initialize weights for linear and embedding layers
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        assert T <= self.config.block_size, f"seq len {T} > block_size {self.config.block_size}"
+
+        x = self.drop(self.tok_emb(idx))          # [B, T, C]  — NO pos emb; RoPE handles position
+
+        total_aux = 0.0
+        for block in self.blocks:
+            x, aux = block(x)                     # residual/skip connections live INSIDE Block
+            total_aux = total_aux + aux
+
+        x = self.final_norm(x)                    # final pre-LM-head norm
+        logits = self.lm_head(x)                  # [B, T, vocab_size]
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+        return logits, loss, total_aux
