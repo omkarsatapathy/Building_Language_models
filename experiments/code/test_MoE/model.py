@@ -109,6 +109,8 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
 
+        self.pre_norm = nn.RMSNorm(config.n_embd)
+
         # one projection for q, k, v (split later)
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
@@ -125,33 +127,34 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
-        def forward(self, x):
-            B, T, C = x.shape
-            q, k, v = self.c_attn(x).split(C, dim=2)     # each [B, T, C]
+    def forward(self, x):
+        B, T, C = x.shape
+        x = self.pre_norm(x)  
+        q, k, v = self.c_attn(x).split(C, dim=2)     # each [B, T, C]
 
-            # -> [B, n_head, T, head_dim]
-            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-            k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-            v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        # -> [B, n_head, T, head_dim]
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-            # QK-norm (over head_dim) BEFORE RoPE
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        # QK-norm (over head_dim) BEFORE RoPE
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
-            # RoPE on q and k, sliced to current T
-            cos = self.rope_cos[:T]
-            sin = self.rope_sin[:T]
-            q = apply_rotary_pos_emb(q, cos, sin)
-            k = apply_rotary_pos_emb(k, cos, sin)
+        # RoPE on q and k, sliced to current T
+        cos = self.rope_cos[:T]
+        sin = self.rope_sin[:T]
+        q = apply_rotary_pos_emb(q, cos, sin)
+        k = apply_rotary_pos_emb(k, cos, sin)
 
-            # causal attention (Flash kernel when available)
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                is_causal=True,
-                dropout_p=self.attn_dropout if self.training else 0.0,
-            )
+        # causal attention (Flash kernel when available)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=True,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+        )
 
-            # -> [B, T, C]
-            y = y.transpose(1, 2).contiguous().view(B, T, C)
-            y = self.resid_dropout(self.c_proj(y))
-            return y
+        # -> [B, T, C]
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
