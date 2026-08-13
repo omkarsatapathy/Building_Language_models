@@ -4,7 +4,10 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+from swiglu import SwiGLUFFN
 
 from dataclasses import dataclass
 import math
@@ -22,9 +25,12 @@ class MoeConfig:
     n_head: int = 8
     n_embd: int = 768
     dropout: float = 0.1
-    n_experts: int = 4
 
     batch_size: int = 32
+    #MoE specific parameters
+    n_experts: int = 4
+    top_k: int = 2          # each token routes to 2 of the 4 experts
+
 
 device = "cuda" if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else "cpu"
 DATA_DIR = Path("toy_datasets/tokenized_100M")
@@ -99,8 +105,6 @@ def apply_rotary_pos_emb(x, cos, sin):
 # ------------------------ Implementation Causal Self Attention ---------------------------------------- #
 # ______________________________________________________________________________________________________ #
 
-import torch.nn.functional as F
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -158,3 +162,69 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
+
+
+
+# ______________________________________________________________________________________________________ #
+# ------------------------ Implementation of Mixture of Experts ---------------------------------------- #
+# ______________________________________________________________________________________________________ #
+
+class Expert(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.net = SwiGLUFFN(config.n_embd, dropout=config.dropout)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.pre_norm = nn.RMSNorm(config.n_embd)     # pre-norm lives inside, like attn
+        self.n_experts = config.n_experts
+        self.top_k = config.top_k
+        self.gate = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        self.experts = nn.ModuleList([Expert(config) for _ in range(config.n_experts)])
+        self.shared_expert = Expert(config)      # always active, no gate
+
+    def forward(self, x):
+        x = self.pre_norm(x)
+        B, T, C = x.shape
+        x_flat = x.view(-1, C)                                  # N tokens (N = B·T), each a C-dim vector.
+
+        logits = self.gate(x_flat)                              # [N, n_experts]
+        probs  = F.softmax(logits, dim=-1)                      # full dist over ALL experts (for P_i)
+        topk_val, topk_idx = logits.topk(self.top_k, dim=-1)    # for each token, the indices of its top-k experts. e.g. row for token 5 might be [2, 0] (experts 2 and 0).
+        topk_gate = F.softmax(topk_val, dim=-1)                 # — the softmax weight for each of those k choices. e.g. [0.7, 0.3]
+        out = torch.zeros_like(x_flat)                          # This is where results get summed into. A token routed to 2 experts will get two additions here.
+
+        #For Next step training, we will also add a shared expert that is always active for every token. This is to ensure that every token gets some gradient signal, even if it is not routed to any of the top-k experts. This is a common technique in MoE models to prevent dead experts and improve training stability.
+        # shared = self.shared_expert(x_flat)
+        # out = out + shared                                      # every token gets shared + its top-k routed
+
+        for e in range(self.n_experts):                         # Handle one expert at a time.
+            mask = (topk_idx == e)                              # produces a matrix like boolean marking where in the top-k lists expert e appears. Example with N=3, k=2:
+            if mask.any():
+                token_idx, slot = mask.nonzero(as_tuple=True)
+                weights = topk_gate[token_idx, slot].unsqueeze(-1)  # For each selected token, fetch its gate weight for this specific expert.
+                out[token_idx] += weights * self.experts[e](x_flat[token_idx])
+
+        # ---- load-balancing auxiliary loss ----
+        P = probs.mean(dim=0)                                       # [n_experts]  mean prob mass (soft, has grad)
+        one_hot = F.one_hot(topk_idx, self.n_experts).sum(dim=1)    # [N, n_experts] dispatch count per token
+        f = one_hot.float().mean(dim=0)                             # [n_experts]  fraction of tokens per expert
+        aux_loss = self.n_experts * torch.sum(f * P)                # scalar
+        return out.view(B, T, C), aux_loss
+
+class Block(nn.Module): 
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config)
+        self.moe = MoE(config)
+
+    def forward(self, x):
+        x = x + self.attn(x)    # attn owns its pre-norm
+        moe_out, aux = self.moe(x)
+        x = x + moe_out     # moe owns its pre-norm
+        return x, aux
