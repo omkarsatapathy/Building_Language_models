@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 from pathlib import Path
 
@@ -329,23 +330,6 @@ grad_accum_steps = 4               # effective batch = batch_size * grad_accum_s
 autocast_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
 def get_lr(step):
-    """
-    Imagine your model is a guy learning to walk into a dark room to find a light switch (the best weights). The learning rate is how big his steps are.
-Chapter 1 — Warmup (baby steps) 👶
-He just woke up. If he sprints immediately, he'll trip and smash his face (loss explodes 💥). So he starts with tiny steps and slowly speeds up.
-max_lr * (step + 1) / warmup_steps
-"Step 1... okay. Step 2... a bit bigger... by step 100, full stride!"
-Chapter 2 — Full speed (confident striding) 🏃
-Now he's warmed up and takes big confident steps (max_lr = 6e-4). He's covering a lot of ground fast, getting close to the light switch.
-Chapter 3 — Cosine decay (tip-toeing) 🐈
-He's near the switch now. If he keeps taking huge steps, he'll overshoot and walk right past it. So he gradually slows down — smaller and smaller steps — tip-toeing carefully until he gently taps the switch.
-0.5 * (1 + cos(...)) → this is just a smooth slowdown curve (like a car easing off the gas, not slamming the brakes).
-Chapter 4 — The floor (never fully stop) 🛑
-He never completely freezes (min_lr, 10% of max). A tiny shuffle keeps him adjusting, because stopping dead is worse than nudging.
-In one sentence
-Start slow → go fast → slow down smoothly → keep a tiny wiggle. 🐢🐇🐢
-That's the whole schedule. The cos is just the fancy math for "slow down smoothly instead of suddenly."
-    """
     if step < warmup_steps:
         return max_lr * (step + 1) / warmup_steps
 
@@ -359,4 +343,124 @@ That's the whole schedule. The cos is just the fancy math for "slow down smoothl
     return min_lr + coeff * (max_lr - min_lr)
 
 
+def infinite_batches(loader):
+    while True:
+        for xb, yb in loader:
+            yield xb, yb
+
+def train_step(model, batch_iter, optimizer, grad_accum_steps, config):
+    optimizer.zero_grad(set_to_none=True)
+
+    loss_accum = 0.0
+    aux_accum  = 0.0
+
+    for micro in range(grad_accum_steps):
+        xb, yb = next(batch_iter)
+        xb, yb = xb.to(device), yb.to(device)
+
+        with torch.autocast(device_type=device, dtype=autocast_dtype):
+            logits, aux = model(xb)
+            ce_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                yb.view(-1),
+                ignore_index=-1,
+            )
+            loss = ce_loss + config.aux_weight * aux
+
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        aux_accum  += (aux.detach() / grad_accum_steps)
+
+        loss.backward()
+
+    return loss_accum, aux_accum
+
+@torch.no_grad()
+def evaluate(model, val_iter, eval_steps, config):
+    model.eval()                       # dropout OFF
+    loss_accum = 0.0
+    for _ in range(eval_steps):
+        xb, yb = next(val_iter)
+        xb, yb = xb.to(device), yb.to(device)
+        with torch.autocast(device_type=device, dtype=autocast_dtype):
+            logits, aux = model(xb)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                yb.view(-1),
+                ignore_index=-1,
+            )
+        loss_accum += loss.detach() / eval_steps
+    model.train()                      # back to train mode
+    return loss_accum
+
+
+# ---- build everything ----
+config    = MoeConfig()
+model     = GPTMoE(config).to(device)
+# model = torch.compile(model)
+optimizer = model.configure_optimizers(weight_decay, max_lr, device)
+
+train_loader = data_loader("train", config, num_workers=2, shuffle=True)
+batch_iter   = infinite_batches(train_loader)
+
+val_loader = data_loader("val", config, num_workers=2, shuffle=False)
+val_iter   = infinite_batches(val_loader)
+
+eval_every = 250     # steps
+eval_steps = 20      # micro-batches per eval
+
+CKPT_DIR = Path("checkpoints")
+CKPT_DIR.mkdir(exist_ok=True)
+
+def save_checkpoint(model, optimizer, step, val_loss):
+    ckpt = {
+        "model":     model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step":      step,
+        "val_loss":  val_loss,
+        "config":    config,
+    }
+    path = CKPT_DIR / f"moe_step{step}_with{val_loss:.4f}.pt"
+    torch.save(ckpt, path)
+    print(f"  💾 saved {path}  (val_loss {val_loss:.4f})")
+
+
+# ---- the loop ----
+for step in range(max_steps):
+    t0 = time.time()
+
+    # 1) set LR for this step (from Piece 2)
+    lr = get_lr(step)
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
+
+    # 2) accumulate grads over micro-batches (from Piece 4)
+    loss_accum, aux_accum = train_step(
+        model, batch_iter, optimizer, grad_accum_steps, config
+    )
+
+    # 3) clip global grad norm to 1.0 — tames spikes
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+    # 4) take the step
+    optimizer.step()
+
+    # 5) timing + throughput
+    if device == "cuda":
+        torch.cuda.synchronize()      # wait for GPU to actually finish
+    dt = time.time() - t0
+    tokens = config.batch_size * config.block_size * grad_accum_steps
+    tok_per_sec = tokens / dt
+
+    # 6) log
+    if step % 10 == 0:
+        print(
+            f"step {step:5d} | loss {loss_accum:.4f} | aux {aux_accum:.4f} | "
+            f"lr {lr:.2e} | norm {norm:.2f} | {dt*1000:.0f}ms | {tok_per_sec:,.0f} tok/s"
+        )
+    # ---- periodic eval + checkpoint ----
+    if step > 0 and step % eval_every == 0:
+        val_loss = evaluate(model, val_iter, eval_steps, config)
+        print(f"  >>> eval @ step {step}: val_loss {val_loss:.4f}")
+        save_checkpoint(model, optimizer, step, val_loss)
 
