@@ -14,12 +14,14 @@ import math
 import numpy as np
 import tiktoken
 
+torch.set_float32_matmul_precision("high")
+
 data = Path("toy_datasets/tiny_stories_100M.txt").read_text(encoding="utf-8")
 # print(len(data))
 
 @dataclass
 class MoeConfig:
-    vocab_size: int = 50304
+    vocab_size: int = 50304 # use aproximate Nice numbers for faster training !
     block_size: int = 1024
     n_layer: int = 6
     n_head: int = 8
@@ -30,6 +32,9 @@ class MoeConfig:
     #MoE specific parameters
     n_experts: int = 4
     top_k: int = 2          # each token routes to 2 of the 4 experts
+
+    aux_weight: float = 0.01     # weight on MoE load-balancing loss
+
 
 
 device = "cuda" if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else "cpu"
@@ -259,6 +264,37 @@ class GPTMoE(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # all params that require gradients
+        param_dict = {n: p for n, p in self.named_parameters() if p.requires_grad}
+
+        # split: 2D+ tensors decay (matmuls + embeddings), 1D don't (biases, norms)
+        decay_params   = [p for p in param_dict.values() if p.dim() >= 2]
+        nodecay_params = [p for p in param_dict.values() if p.dim() <  2]
+
+        optim_groups = [
+            {"params": decay_params,   "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
+
+        # fused AdamW = single CUDA kernel for the update; only on CUDA
+        use_fused = (device == "cuda")
+
+        optimizer = torch.optim.AdamW(
+            optim_groups,
+            lr=learning_rate,
+            betas=(0.9, 0.95),      # GPT-3 recipe
+            eps=1e-8,
+            fused=use_fused,
+        )
+
+        num_decay   = sum(p.numel() for p in decay_params)
+        num_nodecay = sum(p.numel() for p in nodecay_params)
+        print(f"decayed params:   {len(decay_params)} tensors, {num_decay:,} values")
+        print(f"un-decayed params:{len(nodecay_params)} tensors, {num_nodecay:,} values")
+
+        return optimizer
+
     def forward(self, idx, targets=None):
         B, T = idx.shape
         assert T <= self.config.block_size, f"seq len {T} > block_size {self.config.block_size}"
@@ -273,11 +309,54 @@ class GPTMoE(nn.Module):
         x = self.final_norm(x)                    # final pre-LM-head norm
         logits = self.lm_head(x)                  # [B, T, vocab_size]
 
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-            )
-        return logits, loss, total_aux
+        return logits, total_aux
+
+
+# ______________________________________________________________________________________________________ #
+# -------------------------------------- Training Loop ------------------------------------------------- #
+# ______________________________________________________________________________________________________ #
+
+# ---- training hyperparameters ----
+max_lr        = 6e-4
+min_lr        = max_lr * 0.1        # 10% of max, per GPT-3 recipe
+warmup_steps  = 100
+max_steps     = 5000
+weight_decay  = 0.1
+grad_clip     = 1.0
+grad_accum_steps = 4               # effective batch = batch_size * grad_accum_steps
+
+# autocast dtype: bf16 on CUDA, fp32 elsewhere (MPS bf16 support is spotty)
+autocast_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+def get_lr(step):
+    """
+    Imagine your model is a guy learning to walk into a dark room to find a light switch (the best weights). The learning rate is how big his steps are.
+Chapter 1 — Warmup (baby steps) 👶
+He just woke up. If he sprints immediately, he'll trip and smash his face (loss explodes 💥). So he starts with tiny steps and slowly speeds up.
+max_lr * (step + 1) / warmup_steps
+"Step 1... okay. Step 2... a bit bigger... by step 100, full stride!"
+Chapter 2 — Full speed (confident striding) 🏃
+Now he's warmed up and takes big confident steps (max_lr = 6e-4). He's covering a lot of ground fast, getting close to the light switch.
+Chapter 3 — Cosine decay (tip-toeing) 🐈
+He's near the switch now. If he keeps taking huge steps, he'll overshoot and walk right past it. So he gradually slows down — smaller and smaller steps — tip-toeing carefully until he gently taps the switch.
+0.5 * (1 + cos(...)) → this is just a smooth slowdown curve (like a car easing off the gas, not slamming the brakes).
+Chapter 4 — The floor (never fully stop) 🛑
+He never completely freezes (min_lr, 10% of max). A tiny shuffle keeps him adjusting, because stopping dead is worse than nudging.
+In one sentence
+Start slow → go fast → slow down smoothly → keep a tiny wiggle. 🐢🐇🐢
+That's the whole schedule. The cos is just the fancy math for "slow down smoothly instead of suddenly."
+    """
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+
+    # 2) after training ends, hold at min_lr
+    if step >= max_steps:
+        return min_lr
+
+    # 3) cosine decay from max_lr -> min_lr in between
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))   # 1 -> 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+
+
