@@ -120,6 +120,7 @@ datasets/
 *.tar.gz
 *.gz
 *.7z
+*.txt
 
 # ---- Experiment tracking / outputs ----
 runs/
