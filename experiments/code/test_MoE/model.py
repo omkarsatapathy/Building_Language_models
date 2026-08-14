@@ -17,19 +17,18 @@ import tiktoken
 
 torch.set_float32_matmul_precision("high")
 
-data = Path("toy_datasets/tiny_stories_100M.txt").read_text(encoding="utf-8")
-# print(len(data))
 
 @dataclass
 class MoeConfig:
+    # ~30M total params on 50304 vocab (weight-tied embeddings dominate the count)
     vocab_size: int = 50304
     block_size: int = 1024
-    n_layer: int = 4          # was 6
-    n_head: int = 8           # head_dim = 128/8 = 16 (even, RoPE-ok)
-    n_embd: int = 128         # was 768
-    dropout: float = 0.1
+    n_layer: int = 6          # 6 blocks
+    n_head: int = 8           # head_dim = 256/8 = 32 (even, RoPE-ok)
+    n_embd: int = 256         # embedding = 50304*256 ~= 12.9M
+    dropout: float = 0.0      # pretraining on ~545M tokens (~18 tok/param); no dropout
 
-    batch_size: int = 32
+    batch_size: int = 64      # H100 80GB: this model is tiny, room to spare
     n_experts: int = 4
     top_k: int = 2
     aux_weight: float = 0.01
@@ -37,7 +36,11 @@ class MoeConfig:
 
 
 device = "cuda" if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else "cpu"
-DATA_DIR = Path("toy_datasets/tokenized_100M")
+
+# data lives under <repo>/Datasets/processed_dataset/tiny_stories_<LABEL>/
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DATA_LABEL = os.getenv("DATA_LABEL", "all")
+DATA_DIR = REPO_ROOT / "Datasets" / "processed_dataset" / f"tiny_stories_{DATA_LABEL}"
 
 # ______________________________________________________________________________________________________ #
 # ---------------------------------------- Class Dataloaders ------------------------------------------- #
@@ -48,7 +51,7 @@ class TinyStoriesDataset(Dataset):
         assert split in ['train', 'val']
         self.block_size = block_size
         self._data = None
-        self.path = DATA_DIR / f"{split}_100M.npy"
+        self.path = DATA_DIR / f"{split}_{DATA_LABEL}.npy"
         self._n = len(np.load(self.path, mmap_mode='r'))
 
     @property
@@ -320,14 +323,14 @@ class GPTMoE(nn.Module):
 # -------------------------------------- Training Loop ------------------------------------------------- #
 # ______________________________________________________________________________________________________ #
 
-# ---- training hyperparameters ----
+# ---- training hyperparameters (single H100) ----
 max_lr        = 6e-4
 min_lr        = max_lr * 0.1        # 10% of max, per GPT-3 recipe
-warmup_steps  = int(os.getenv("WARMUP_STEPS", 100))
-max_steps     = int(os.getenv("MAX_STEPS", 5000))
+warmup_steps  = int(os.getenv("WARMUP_STEPS", 200))
+max_steps     = int(os.getenv("MAX_STEPS", 2000))          # ~1.05B tokens (~2 epochs of 545M)
 weight_decay  = 0.1
 grad_clip     = 1.0
-grad_accum_steps = int(os.getenv("GRAD_ACCUM_STEPS", 4))   # effective batch = batch_size * grad_accum_steps
+grad_accum_steps = int(os.getenv("GRAD_ACCUM_STEPS", 8))   # 64*1024*8 ~= 524k tokens/step
 
 # autocast dtype: bf16 on CUDA, fp32 elsewhere (MPS bf16 support is spotty)
 autocast_dtype = torch.bfloat16 if device == "cuda" else torch.float32
@@ -439,7 +442,7 @@ val_iter   = infinite_batches(val_loader)
 eval_every = int(os.getenv("EVAL_EVERY", 250))   # steps
 eval_steps = int(os.getenv("EVAL_STEPS", 20))    # micro-batches per eval
 
-CKPT_DIR = Path("checkpoints")
+CKPT_DIR = REPO_ROOT / "checkpoints"
 CKPT_DIR.mkdir(exist_ok=True)
 
 def count_params(model):
@@ -467,7 +470,7 @@ def save_checkpoint(model, optimizer, step, val_loss):
 # ---- CSV micro-batch logger ----
 import csv
 
-LOG_DIR = Path("logs")
+LOG_DIR = REPO_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 csv_path = LOG_DIR / "train_micro_log.csv"
 

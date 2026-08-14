@@ -13,7 +13,7 @@ Writes (label = token target, e.g. "500M"):
     Datasets/processed_dataset/tiny_stories_500M/val_500M.npy
 
 Usage:
-    python data_processor.py                    # default 100M tokens
+    python data_processor.py                    # process the ENTIRE raw file (label 'all')
     python data_processor.py --tokens 500M
     python data_processor.py --tokens 5000000 --val-frac 0.01
 """
