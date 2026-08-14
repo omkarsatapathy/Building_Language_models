@@ -427,7 +427,7 @@ config    = MoeConfig()
 if os.getenv("BATCH_SIZE"): config.batch_size = int(os.getenv("BATCH_SIZE"))
 if os.getenv("BLOCK_SIZE"): config.block_size = int(os.getenv("BLOCK_SIZE"))
 model     = GPTMoE(config).to(device)
-# model = torch.compile(model)
+model = torch.compile(model)
 optimizer = model.configure_optimizers(weight_decay, max_lr, device)
 
 # num_workers=0 is safe here because the training loop runs at module level
