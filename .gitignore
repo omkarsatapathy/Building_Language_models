@@ -109,7 +109,6 @@ dmypy.json
 
 # ---- Datasets / large artifacts ----
 data/
-datasets/
 *.csv
 *.tsv
 *.parquet
