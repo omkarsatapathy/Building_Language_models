@@ -15,6 +15,8 @@ import math
 import numpy as np
 import tiktoken
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
 
@@ -426,7 +428,7 @@ config    = MoeConfig()
 if os.getenv("BATCH_SIZE"): config.batch_size = int(os.getenv("BATCH_SIZE"))
 if os.getenv("BLOCK_SIZE"): config.block_size = int(os.getenv("BLOCK_SIZE"))
 model     = GPTMoE(config).to(device)
-model = torch.compile(model)
+model = torch.compile(model, mode="max-autotune")
 
 optimizer = model.configure_optimizers(weight_decay, max_lr, device)
 
