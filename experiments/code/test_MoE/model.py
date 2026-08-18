@@ -20,12 +20,12 @@ torch.set_float32_matmul_precision("high")
 
 @dataclass
 class MoeConfig:
-    # ~30M total params on 50304 vocab (weight-tied embeddings dominate the count)
-    vocab_size: int = 50304
+    # ~39M total params (~32.5M active) @ n_embd=320, n_layer=8, vocab 8192
+    vocab_size: int = 8192    # == tinystories_bpe_8k.json n_vocab; already a multiple of 64
     block_size: int = 1024
-    n_layer: int = 6          # 6 blocks
-    n_head: int = 8           # head_dim = 256/8 = 32 (even, RoPE-ok)
-    n_embd: int = 256         # embedding = 50304*256 ~= 12.9M
+    n_layer: int = 8          # 8 blocks
+    n_head: int = 8           # head_dim = 320/8 = 40 (even, RoPE-ok)
+    n_embd: int = 320         # embedding = 8192*320 ~= 2.62M
     dropout: float = 0.0      # pretraining on ~545M tokens (~18 tok/param); no dropout
 
     batch_size: int = 64      # H100 80GB: this model is tiny, room to spare
@@ -37,10 +37,9 @@ class MoeConfig:
 
 device = "cuda" if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else "cpu"
 
-# data lives under <repo>/Datasets/processed_dataset/tiny_stories_<LABEL>/
+# BPE-tokenized instruct corpus (uint16 .npy) lives directly under <repo>/Datasets/
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DATA_LABEL = os.getenv("DATA_LABEL", "all")
-DATA_DIR = REPO_ROOT / "Datasets" / "processed_dataset" / f"tiny_stories_{DATA_LABEL}"
+DATA_DIR = REPO_ROOT / "Datasets"
 
 # ______________________________________________________________________________________________________ #
 # ---------------------------------------- Class Dataloaders ------------------------------------------- #
@@ -51,7 +50,7 @@ class TinyStoriesDataset(Dataset):
         assert split in ['train', 'val']
         self.block_size = block_size
         self._data = None
-        self.path = DATA_DIR / f"{split}_{DATA_LABEL}.npy"
+        self.path = DATA_DIR / f"tinystories_instruct_{split}_uint16.npy"
         self._n = len(np.load(self.path, mmap_mode='r'))
 
     @property
@@ -428,10 +427,9 @@ if os.getenv("BATCH_SIZE"): config.batch_size = int(os.getenv("BATCH_SIZE"))
 if os.getenv("BLOCK_SIZE"): config.block_size = int(os.getenv("BLOCK_SIZE"))
 model     = GPTMoE(config).to(device)
 model = torch.compile(model)
+
 optimizer = model.configure_optimizers(weight_decay, max_lr, device)
 
-# num_workers=0 is safe here because the training loop runs at module level
-# (no __main__ guard); spawned workers would re-import and re-run it.
 num_workers = int(os.getenv("NUM_WORKERS", 0))
 train_loader = data_loader("train", config, num_workers=num_workers, shuffle=True)
 batch_iter   = infinite_batches(train_loader)
