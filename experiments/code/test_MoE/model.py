@@ -325,9 +325,9 @@ class GPTMoE(nn.Module):
 # ______________________________________________________________________________________________________ #
 
 # ---- training hyperparameters (single H100) ----
-max_lr        = 6e-4
+max_lr        = 8.5e-4              # 6e-4 × √2 for 2× global batch (128→256)
 min_lr        = max_lr * 0.1        # 10% of max, per GPT-3 recipe
-warmup_steps  = int(os.getenv("WARMUP_STEPS", 200))
+warmup_steps  = int(os.getenv("WARMUP_STEPS", 200))   # ~2.4% of 8,316 steps @ batch 256; use 150 for batch 320
 max_steps     = int(os.getenv("MAX_STEPS", 2000))          # ~1.05B tokens (~2 epochs of 545M)
 weight_decay  = 0.1
 grad_clip     = 1.0
