@@ -21,7 +21,7 @@ torch.set_float32_matmul_precision("high")
 
 
 @dataclass
-class MoeConfig:
+class TinyMoeConfig:
     # ~39M total params (~32.5M active) @ n_embd=320, n_layer=8, vocab 8192
     vocab_size: int = 8192    # == tinystories_bpe_8k.json n_vocab; already a multiple of 64
     block_size: int = 1024
@@ -423,7 +423,7 @@ def evaluate(model, val_iter, eval_steps, config):
 
 
 # ---- build everything ----
-config    = MoeConfig()
+config    = TinyMoeConfig()
 # optional env overrides (used by run.sh smoke to fit on MPS)
 if os.getenv("BATCH_SIZE"): config.batch_size = int(os.getenv("BATCH_SIZE"))
 if os.getenv("BLOCK_SIZE"): config.block_size = int(os.getenv("BLOCK_SIZE"))

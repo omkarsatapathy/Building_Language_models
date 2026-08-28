@@ -3,7 +3,7 @@ Inference / sanity check for the trained GPT-MoE checkpoint.
 
 Why self-contained: model.py runs its training loop at module level (no
 `__main__` guard), so importing it would start training. We therefore redefine
-the model here. `MoeConfig` is defined in this file so the pickled config object
+the model here. `TinyMoeConfig` is defined in this file so the pickled config object
 inside the checkpoint unpickles cleanly (it was saved from __main__).
 
 What it does:
@@ -82,7 +82,7 @@ device = (
 
 
 @dataclass
-class MoeConfig:
+class TinyMoeConfig:
     vocab_size: int = 50304
     block_size: int = 1024
     n_layer: int = 6
@@ -288,7 +288,7 @@ def main():
 
     # ---- load checkpoint ----
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    config = ckpt.get("config", MoeConfig())
+    config = ckpt.get("config", TinyMoeConfig())
     print(f"trained step {ckpt.get('step')} | val_loss {ckpt.get('val_loss'):.4f}")
 
     model = GPTMoE(config).to(device)

@@ -21,7 +21,7 @@ Built and aligned:
 - [ ] **Load-balancing auxiliary loss for MoE.** Without it the router collapses onto a few
       experts (the classic MoE stability failure). MoE forward must RETURN an aux-loss term;
       Block and top-level model must accumulate it up to the training loop. This is the next step.
-- [ ] **Config cleanup:** `n_experts` is declared twice in MoeConfig — remove the duplicate.
+- [ ] **Config cleanup:** `n_experts` is declared twice in TinyMoeConfig — remove the duplicate.
 - [ ] **Verify** the `device=device` default was removed from `build_RoPE_cache` signature
       (device should come from the registered buffer via `.to(device)`).
 - [ ] Top-level model (token embedding, stack of Blocks, final norm, LM head, weight tying)

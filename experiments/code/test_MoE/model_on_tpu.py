@@ -78,7 +78,7 @@ if not hasattr(nn, "RMSNorm"):
 
 
 @dataclass
-class MoeConfig:
+class TinyMoeConfig:
     # ~27M total params on 50304 vocab (weight-tied embeddings dominate the count)
     vocab_size: int = 50304
     block_size: int = 1024
@@ -620,7 +620,7 @@ def _mp_fn(index):
     torch.manual_seed(1337)
 
     # ---- build everything ----
-    config = MoeConfig()
+    config = TinyMoeConfig()
     # optional env overrides (used by run.sh smoke tests)
     if os.getenv("BATCH_SIZE"): config.batch_size = int(os.getenv("BATCH_SIZE"))
     if os.getenv("BLOCK_SIZE"): config.block_size = int(os.getenv("BLOCK_SIZE"))

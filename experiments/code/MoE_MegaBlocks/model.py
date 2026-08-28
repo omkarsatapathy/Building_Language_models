@@ -201,7 +201,7 @@ def build_mb_args(config):
         moe_num_experts=config.n_experts,
         moe_top_k=config.top_k,
         moe_loss_weight=config.aux_weight,   # load-balancing aux weight (applied in loop)
-        mlp_type="glu",                      # SwiGLU-style gated experts
+        mlp_type="glu",                      # SwiGLU-style gated experts. Need confirmation after installation and Dry run
         mlp_impl="grouped",                  # grouped-GEMM path (megablocks[gg], Hopper)
         bias=False,                          # LLaMA-style, matches your SwiGLUFFN
         return_bias=False,                   # forward returns just the tensor
