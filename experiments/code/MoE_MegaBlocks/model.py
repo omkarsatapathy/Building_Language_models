@@ -35,8 +35,8 @@ class TinyMoeConfig:
     dropout: float = 0.0      # pretraining on ~545M tokens (~18 tok/param); no dropout
 
     batch_size: int = 64      # H100 80GB: this model is tiny, room to spare
-    n_experts: int = 4
-    top_k: int = 1
+    n_experts: int = 8
+    top_k: int = 2
 
     moe_ffn_hidden: int = 0         # 0 -> auto = swiglu_hidden_dim(n_embd); expert FFN inner size
     shared_expert: bool = False     # megablocks built-in always-on shared expert
@@ -181,7 +181,7 @@ class CausalFlashAttention(nn.Module):
 
 
 # ______________________________________________________________________________________________________ #
-# ------------------------ Implementation of Mixture of Experts ---------------------------------------- #
+# ------------------------ Implementation of Mixture of Experts In Megablocks -------------------------- #
 # ______________________________________________________________________________________________________ #
 
 class Expert(nn.Module):
@@ -191,6 +191,18 @@ class Expert(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+def mb_route_fractions(n_experts):
+    """Per-expert token fraction, summed across all dMoE layers, from megablocks'
+    global load-balancing state. Call AFTER forward, BEFORE clear_load_balancing_loss().
+    Returns [n_experts] summing to top_k (balanced = top_k / n_experts)."""
+    stats = mb_moe.get_load_balancing_loss()          # list of (tokens_per_expert, scores)
+    if not stats:
+        return torch.zeros(n_experts)
+    total = torch.zeros(n_experts, device=stats[0][0].device, dtype=torch.float32)
+    for tokens_per_expert, _ in stats:
+        total += tokens_per_expert.float()
+    return total / total.sum().clamp_min(1)           # fractions over all routed tokens
 
 def build_mb_args(config):
     """Construct the megablocks Arguments for one dMoE layer (H100 / bf16 / grouped-GEMM)."""
@@ -231,51 +243,51 @@ class MegaBlocksMoE(nn.Module):
         f = torch.zeros(self.n_experts, device=x.device)        # routing frac filled in loop
         return out, aux, f
 
-class MoE(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.pre_norm = nn.RMSNorm(config.n_embd)     # pre-norm lives inside, like attn
-        self.n_experts = config.n_experts
-        self.top_k = config.top_k
-        self.gate = nn.Linear(config.n_embd, config.n_experts, bias=False)
-        self.experts = nn.ModuleList([Expert(config) for _ in range(config.n_experts)])
-        self.shared_expert = Expert(config)      # always active, no gate
+# class MoE(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.pre_norm = nn.RMSNorm(config.n_embd)     # pre-norm lives inside, like attn
+#         self.n_experts = config.n_experts
+#         self.top_k = config.top_k
+#         self.gate = nn.Linear(config.n_embd, config.n_experts, bias=False)
+#         self.experts = nn.ModuleList([Expert(config) for _ in range(config.n_experts)])
+#         self.shared_expert = Expert(config)      # always active, no gate
 
-    def forward(self, x):
-        x = self.pre_norm(x)
-        B, T, C = x.shape
-        x_flat = x.view(-1, C)                                  # N tokens (N = B·T), each a C-dim vector.
+#     def forward(self, x):
+#         x = self.pre_norm(x)
+#         B, T, C = x.shape
+#         x_flat = x.view(-1, C)                                  # N tokens (N = B·T), each a C-dim vector.
 
-        logits = self.gate(x_flat)                              # [N, n_experts] This is the Routing Matrix (R) for all tokens. Each row is a token, each column is an expert.
-        probs  = F.softmax(logits, dim=-1)                      # full dist over ALL experts (for P_i)
-        topk_val, topk_idx = logits.topk(self.top_k, dim=-1)    # for each token, the indices of its top-k experts. for k =2 -> the 2 winning scores and  WHICH experts won e.g. row for token 5 might be [2, 0] (experts 2 and 0).
-        topk_gate = F.softmax(topk_val, dim=-1)                 # — the softmax weight for each of those k choices. e.g. [0.7, 0.3]
-        out = torch.zeros_like(x_flat)                          # This is where results get summed into. A token routed to 2 experts will get two additions here.
+#         logits = self.gate(x_flat)                              # [N, n_experts] This is the Routing Matrix (R) for all tokens. Each row is a token, each column is an expert.
+#         probs  = F.softmax(logits, dim=-1)                      # full dist over ALL experts (for P_i)
+#         topk_val, topk_idx = logits.topk(self.top_k, dim=-1)    # for each token, the indices of its top-k experts. for k =2 -> the 2 winning scores and  WHICH experts won e.g. row for token 5 might be [2, 0] (experts 2 and 0).
+#         topk_gate = F.softmax(topk_val, dim=-1)                 # — the softmax weight for each of those k choices. e.g. [0.7, 0.3]
+#         out = torch.zeros_like(x_flat)                          # This is where results get summed into. A token routed to 2 experts will get two additions here.
 
-        #For Next step training, we will also add a shared expert that is always active for every token. This is to ensure that every token gets some gradient signal, even if it is not routed to any of the top-k experts. This is a common technique in MoE models to prevent dead experts and improve training stability.
-        # shared = self.shared_expert(x_flat)
-        # out = out + shared                                      # every token gets shared + its top-k routed
+#         #For Next step training, we will also add a shared expert that is always active for every token. This is to ensure that every token gets some gradient signal, even if it is not routed to any of the top-k experts. This is a common technique in MoE models to prevent dead experts and improve training stability.
+#         # shared = self.shared_expert(x_flat)
+#         # out = out + shared                                      # every token gets shared + its top-k routed
 
-        for e in range(self.n_experts):                         # Handle one expert at a time.
-            mask = (topk_idx == e)                              # produces a matrix like boolean marking where in the top-k lists expert e appears. Example with N=3, k=2:
-            if mask.any():
-                token_idx, slot = mask.nonzero(as_tuple=True)
-                weights = topk_gate[token_idx, slot].unsqueeze(-1)  # For each selected token, fetch its gate weight for this specific expert.
-                out[token_idx] += weights * self.experts[e](x_flat[token_idx])
+#         for e in range(self.n_experts):                         # Handle one expert at a time.
+#             mask = (topk_idx == e)                              # produces a matrix like boolean marking where in the top-k lists expert e appears. Example with N=3, k=2:
+#             if mask.any():
+#                 token_idx, slot = mask.nonzero(as_tuple=True)
+#                 weights = topk_gate[token_idx, slot].unsqueeze(-1)  # For each selected token, fetch its gate weight for this specific expert.
+#                 out[token_idx] += weights * self.experts[e](x_flat[token_idx])
 
-        # ---- load-balancing auxiliary loss ----
-        P = probs.mean(dim=0)                                       # [n_experts]  mean prob mass (soft, has grad)
-        one_hot = F.one_hot(topk_idx, self.n_experts).sum(dim=1)    # [N, n_experts] dispatch count per token
-        f = one_hot.float().mean(dim=0)                             # [n_experts]  fraction of tokens per expert
-        aux_loss = self.n_experts * torch.sum(f * P)                # scalar
-        # f[e] = fraction of tokens routed to expert e; sums to top_k. Balanced = top_k/n_experts.
-        return out.view(B, T, C), aux_loss, f.detach()
+#         # ---- load-balancing auxiliary loss ----
+#         P = probs.mean(dim=0)                                       # [n_experts]  mean prob mass (soft, has grad)
+#         one_hot = F.one_hot(topk_idx, self.n_experts).sum(dim=1)    # [N, n_experts] dispatch count per token
+#         f = one_hot.float().mean(dim=0)                             # [n_experts]  fraction of tokens per expert
+#         aux_loss = self.n_experts * torch.sum(f * P)                # scalar
+#         # f[e] = fraction of tokens routed to expert e; sums to top_k. Balanced = top_k/n_experts.
+#         return out.view(B, T, C), aux_loss, f.detach()
 
 class Block(nn.Module): 
     def __init__(self, config):
         super().__init__()
         self.attn = CausalFlashAttention(config)
-        self.moe = MoE(config)
+        self.moe = MegaBlocksMoE(config)
 
     def forward(self, x):
         x = x + self.attn(x)    # attn owns its pre-norm
@@ -418,14 +430,21 @@ def train_step(model, batch_iter, optimizer, grad_accum_steps, config):
         xb, yb = next(batch_iter)
         xb, yb = xb.to(device), yb.to(device)
 
+        mb_moe.clear_load_balancing_loss()          # fresh global state for this micro-step
         with autocast_ctx():
-            logits, aux, route = model(xb)
+            logits, _, _ = model(xb)                 # placeholder aux/route ignored
             ce_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 yb.view(-1),
                 ignore_index=-1,
             )
-            loss = ce_loss + config.aux_weight * aux
+            # megablocks aggregates per-layer LBL from global state; ALREADY scaled by
+            # moe_loss_weight (== config.aux_weight), so add it directly — do NOT re-multiply.
+            aux = mb_moe.batched_load_balancing_loss(mb_args)
+            loss = ce_loss + aux
+
+        # real per-expert routing fractions (read BEFORE the next clear wipes the state)
+        route = mb_route_fractions(config.n_experts)
 
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
@@ -439,6 +458,7 @@ def train_step(model, batch_iter, optimizer, grad_accum_steps, config):
             "total_loss": (ce_loss + config.aux_weight * aux).item(),
         }
         # per-expert routing fraction (avg over layers); balanced = top_k/n_experts
+        # per-expert routing fraction (summed over layers); balanced = top_k/n_experts
         for e in range(config.n_experts):
             rec[f"expert{e}_frac"] = route[e].item()
         micro_logs.append(rec)
@@ -473,7 +493,19 @@ config    = TinyMoeConfig()
 if os.getenv("BATCH_SIZE"): config.batch_size = int(os.getenv("BATCH_SIZE"))
 if os.getenv("BLOCK_SIZE"): config.block_size = int(os.getenv("BLOCK_SIZE"))
 model     = GPTMoE(config).to(device)
-model = torch.compile(model, mode="max-autotune")
+
+# megablocks Arguments handle (all blocks share identical args) — needed to
+# aggregate the load-balancing loss from megablocks' global state in the loop.
+mb_args = model.blocks[0].moe.args
+# megablocks mutates global LBL state + uses custom kernels; compile can break the
+# aux-loss capture. Keep compile OFF for the first run (COMPILE=0), verify aux is
+# non-zero + balancing, then re-enable with COMPILE=1.
+if os.getenv("COMPILE", "0") == "1":
+    model = torch.compile(model, mode="max-autotune")
+    print("torch.compile: ON (max-autotune)")
+else:
+    print("torch.compile: OFF (megablocks first-run safe mode)")
+
 
 optimizer = model.configure_optimizers(weight_decay, max_lr, device)
 

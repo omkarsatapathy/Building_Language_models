@@ -6,6 +6,10 @@ Why self-contained: model.py runs its training loop at module level (no
 the model here. `TinyMoeConfig` is defined in this file so the pickled config object
 inside the checkpoint unpickles cleanly (it was saved from __main__).
 
+The MoE here mirrors model.py's MegaBlocksMoE (block-sparse dMoE), so it expects a
+checkpoint trained with the megablocks backend. Pass one with --ckpt. Requires CUDA
+(megablocks is CUDA-only).
+
 What it does:
   1. Pull a random story from the toy TinyStories dataset.
   2. Feed the model the first 20 words as a prompt.
@@ -31,7 +35,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tiktoken
 
-from swiglu import SwiGLUFFN   # same folder as this script
+from swiglu import SwiGLUFFN, swiglu_hidden_dim   # same folder as this script
+
+import megablocks.layers.dmoe as mb_dmoe
+import megablocks.layers.arguments as mb_args_mod
+import megablocks.layers.moe as mb_moe
 
 torch.set_float32_matmul_precision("high")
 
@@ -83,15 +91,20 @@ device = (
 
 @dataclass
 class TinyMoeConfig:
-    vocab_size: int = 50304
+    # NOTE: fields must match model.py's TinyMoeConfig so the pickled config in the
+    # checkpoint unpickles cleanly. Values here are only fallback defaults; the real
+    # config is restored from the checkpoint.
+    vocab_size: int = 8192
     block_size: int = 1024
-    n_layer: int = 6
+    n_layer: int = 8
     n_head: int = 8
-    n_embd: int = 256
+    n_embd: int = 320
     dropout: float = 0.0
     batch_size: int = 64
     n_experts: int = 4
-    top_k: int = 2
+    top_k: int = 1
+    moe_ffn_hidden: int = 0
+    shared_expert: bool = False
     aux_weight: float = 0.01
 
 
@@ -169,43 +182,50 @@ class Expert(nn.Module):
         return self.net(x)
 
 
-class MoE(nn.Module):
+def build_mb_args(config):
+    """megablocks Arguments for one dMoE layer (H100 / bf16 / grouped-GEMM). Mirrors model.py."""
+    ffn_hidden = config.moe_ffn_hidden or swiglu_hidden_dim(config.n_embd)
+    return mb_args_mod.Arguments(
+        hidden_size=config.n_embd,
+        ffn_hidden_size=ffn_hidden,
+        moe_num_experts=config.n_experts,
+        moe_top_k=config.top_k,
+        moe_loss_weight=config.aux_weight,
+        mlp_type="glu",
+        mlp_impl="grouped",
+        bias=False,
+        return_bias=False,
+        bf16=True, fp16=False,
+        shared_expert=config.shared_expert,
+        device=torch.device("cuda"),
+    )
+
+
+class MegaBlocksMoE(nn.Module):
+    """Block-sparse dropless MoE (MegaBlocks), (out, aux, f) interface. Mirrors model.py.
+
+    Must match model.py exactly so the trained state_dict keys line up on load.
+    """
     def __init__(self, config):
         super().__init__()
         self.pre_norm = nn.RMSNorm(config.n_embd)
+        self.args = build_mb_args(config)
+        self.moe = mb_dmoe.dMoE(self.args)
         self.n_experts = config.n_experts
-        self.top_k = config.top_k
-        self.gate = nn.Linear(config.n_embd, config.n_experts, bias=False)
-        self.experts = nn.ModuleList([Expert(config) for _ in range(config.n_experts)])
-        self.shared_expert = Expert(config)   # present in state_dict; unused in fwd (matches model.py)
 
     def forward(self, x):
         x = self.pre_norm(x)
-        B, T, C = x.shape
-        x_flat = x.view(-1, C)
-        logits = self.gate(x_flat)
-        probs = F.softmax(logits, dim=-1)
-        topk_val, topk_idx = logits.topk(self.top_k, dim=-1)
-        topk_gate = F.softmax(topk_val, dim=-1)
-        out = torch.zeros_like(x_flat)
-        for e in range(self.n_experts):
-            mask = (topk_idx == e)
-            if mask.any():
-                token_idx, slot = mask.nonzero(as_tuple=True)
-                weights = topk_gate[token_idx, slot].unsqueeze(-1)
-                out[token_idx] += weights * self.experts[e](x_flat[token_idx])
-        P = probs.mean(dim=0)
-        one_hot = F.one_hot(topk_idx, self.n_experts).sum(dim=1)
-        f = one_hot.float().mean(dim=0)
-        aux_loss = self.n_experts * torch.sum(f * P)
-        return out.view(B, T, C), aux_loss, f.detach()
+        out = self.moe(x)
+        aux = torch.zeros((), device=x.device, dtype=x.dtype)
+        f = torch.zeros(self.n_experts, device=x.device)
+        return out, aux, f
 
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.moe = MoE(config)
+        self.moe = MegaBlocksMoE(config)
 
     def forward(self, x):
         x = x + self.attn(x)
