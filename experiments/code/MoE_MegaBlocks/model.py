@@ -8,7 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from swiglu import SwiGLUFFN
+from swiglu import SwiGLUFFN, swiglu_hidden_dim
+
+import megablocks.layers.dmoe as mb_dmoe
+import megablocks.layers.arguments as mb_args_mod
+import megablocks.layers.moe as mb_moe
+
 
 from dataclasses import dataclass
 import math
@@ -21,8 +26,7 @@ torch.set_float32_matmul_precision("high")
 
 
 @dataclass
-class MoeConfig:
-    # ~39M total params (~32.5M active) @ n_embd=320, n_layer=8, vocab 8192
+class TinyMoeConfig:
     vocab_size: int = 8192    # == tinystories_bpe_8k.json n_vocab; already a multiple of 64
     block_size: int = 1024
     n_layer: int = 8          # 8 blocks
@@ -33,6 +37,9 @@ class MoeConfig:
     batch_size: int = 64      # H100 80GB: this model is tiny, room to spare
     n_experts: int = 4
     top_k: int = 1
+
+    moe_ffn_hidden: int = 0         # 0 -> auto = swiglu_hidden_dim(n_embd); expert FFN inner size
+    shared_expert: bool = False     # megablocks built-in always-on shared expert
     aux_weight: float = 0.01
 
 
@@ -185,6 +192,44 @@ class Expert(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+def build_mb_args(config):
+    """Construct the megablocks Arguments for one dMoE layer (H100 / bf16 / grouped-GEMM)."""
+    ffn_hidden = config.moe_ffn_hidden or swiglu_hidden_dim(config.n_embd)
+    return mb_args_mod.Arguments(
+        hidden_size=config.n_embd,
+        ffn_hidden_size=ffn_hidden,
+        moe_num_experts=config.n_experts,
+        moe_top_k=config.top_k,
+        moe_loss_weight=config.aux_weight,   # load-balancing aux weight (applied in loop)
+        mlp_type="glu",                      # SwiGLU-style gated experts
+        mlp_impl="grouped",                  # grouped-GEMM path (megablocks[gg], Hopper)
+        bias=False,                          # LLaMA-style, matches your SwiGLUFFN
+        return_bias=False,                   # forward returns just the tensor
+        bf16=True, fp16=False,               # H100 bf16
+        shared_expert=config.shared_expert,
+        device=torch.device("cuda"),         # Device is hard-coded here; megablocks doesn't support CPU/MPS yet
+    )
+
+class MegaBlocksMoE(nn.Module):
+    """Block-sparse dropless MoE (MegaBlocks) presented with your (out, aux, f) interface.
+
+    Pre-norm stays here (dMoE has none) so Block's residual structure is unchanged.
+    aux/f are placeholders: the real load-balancing loss is pulled from megablocks'
+    global state in the training loop (see batched_load_balancing_loss in Step 4).
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.pre_norm = nn.RMSNorm(config.n_embd)
+        self.args = build_mb_args(config)
+        self.moe = mb_dmoe.dMoE(self.args)
+        self.n_experts = config.n_experts
+
+    def forward(self, x):
+        x = self.pre_norm(x)
+        out = self.moe(x)                    # dMoE handles [B, T, C] internally
+        aux = torch.zeros((), device=x.device, dtype=x.dtype)   # real aux fetched in loop
+        f = torch.zeros(self.n_experts, device=x.device)        # routing frac filled in loop
+        return out, aux, f
 
 class MoE(nn.Module):
     def __init__(self, config):
@@ -423,7 +468,7 @@ def evaluate(model, val_iter, eval_steps, config):
 
 
 # ---- build everything ----
-config    = MoeConfig()
+config    = TinyMoeConfig()
 # optional env overrides (used by run.sh smoke to fit on MPS)
 if os.getenv("BATCH_SIZE"): config.batch_size = int(os.getenv("BATCH_SIZE"))
 if os.getenv("BLOCK_SIZE"): config.block_size = int(os.getenv("BLOCK_SIZE"))
