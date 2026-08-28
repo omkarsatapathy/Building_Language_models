@@ -83,7 +83,7 @@ def data_loader(split, config, num_workers, shuffle=True):
         batch_size=config.batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=(device == "device"),
+        pin_memory=(device == "cuda"),
         drop_last=True,
     )
 
@@ -212,6 +212,7 @@ def build_mb_args(config):
         ffn_hidden_size=ffn_hidden,
         moe_num_experts=config.n_experts,
         moe_top_k=config.top_k,
+        num_layers=config.n_layer,           # LBL global state holds one entry per block
         moe_loss_weight=config.aux_weight,   # load-balancing aux weight (applied in loop)
         mlp_type="glu",                      # SwiGLU-style gated experts. Need confirmation after installation and Dry run
         mlp_impl="grouped",                  # grouped-GEMM path (megablocks[gg], Hopper)
@@ -455,7 +456,7 @@ def train_step(model, batch_iter, optimizer, grad_accum_steps, config):
             "micro":      micro,
             "ce_loss":    ce_loss.item(),
             "aux_loss":   aux.item(),
-            "total_loss": (ce_loss + config.aux_weight * aux).item(),
+            "total_loss": (ce_loss + aux).item(),   # aux pre-scaled by megablocks
         }
         # per-expert routing fraction (avg over layers); balanced = top_k/n_experts
         # per-expert routing fraction (summed over layers); balanced = top_k/n_experts
@@ -501,8 +502,10 @@ mb_args = model.blocks[0].moe.args
 # aux-loss capture. Keep compile OFF for the first run (COMPILE=0), verify aux is
 # non-zero + balancing, then re-enable with COMPILE=1.
 if os.getenv("COMPILE", "0") == "1":
-    model = torch.compile(model, mode="max-autotune")
-    print("torch.compile: ON (max-autotune)")
+    import torch._dynamo
+    torch._dynamo.config.cache_size_limit = 64
+    model = torch.compile(model, dynamic=True)
+    print("torch.compile: ON (dynamic=True)")
 else:
     print("torch.compile: OFF (megablocks first-run safe mode)")
 
@@ -518,6 +521,9 @@ val_iter   = infinite_batches(val_loader)
 
 eval_every = int(os.getenv("EVAL_EVERY", 250))   # steps
 eval_steps = int(os.getenv("EVAL_STEPS", 20))    # micro-batches per eval
+
+# checkpoint on its own cadence, not welded to eval (~15% of the run).
+ckpt_every = int(os.getenv("CKPT_EVERY", max(1, round(0.15 * max_steps / eval_every)) * eval_every))
 
 CKPT_DIR = REPO_ROOT / "checkpoints"
 CKPT_DIR.mkdir(exist_ok=True)
@@ -598,7 +604,7 @@ for step in range(max_steps):
     for rec in micro_logs:
         rec.update({
             "step":          step,
-            "step_ce_loss":  (loss_accum.item() - config.aux_weight * aux_accum.item()),
+            "step_ce_loss":  (loss_accum.item() - aux_accum.item()),
             "step_aux_loss": aux_accum.item(),
             "lr":            lr,
             "grad_norm":     norm.item(),
@@ -620,7 +626,8 @@ for step in range(max_steps):
     if step > 0 and step % eval_every == 0:
         val_loss = evaluate(model, val_iter, eval_steps, config)
         print(f"  >>> eval @ step {step}: val_loss {val_loss:.4f}")
-        save_checkpoint(model, optimizer, step, val_loss)
+        if step % ckpt_every == 0:
+            save_checkpoint(model, optimizer, step, val_loss)
 
 csv_file.close()
 print(f"📊 wrote micro-batch log → {csv_path}")
